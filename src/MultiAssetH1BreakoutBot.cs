@@ -226,7 +226,7 @@ namespace cAlgo.Robots
 
             if (_contexts.Count == 0)
             {
-                Print("STOP: none of the configured symbols exist on this cTrader account. Update Symbol Groups with exact broker symbol names.");
+                Print("STOP: no configured symbols resolved. Select broker symbols in Trade Symbols or edit Extra Symbol Aliases.");
                 Stop();
                 return;
             }
@@ -241,8 +241,8 @@ namespace cAlgo.Robots
                 BotLabel, Profile, Mode, string.Join(",", _contexts.Keys), _initialReferenceEquity, RiskPerTradePercent,
                 MaxAggregatePlannedRiskPercent, DailyLossLimitPercent, OverallLossLimitPercent, NewsSource, _newsTimesUtc.Count);
 
-            if (NewsFilterEnabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
-                Print("SAFE LOCK: News filter requires a schedule, but News Times UTC is empty/invalid. New entries are blocked.");
+            if (NewsFilterEnabled && NewsSource != NewsSourceMode.Disabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
+                Print("SAFE LOCK: News filter requires a valid schedule, but none is available. New entries are blocked.");
         }
 
         protected override void OnTimer()
@@ -558,7 +558,7 @@ namespace cAlgo.Robots
             if (EffectiveNewsPolicy() == NewsPositionPolicy.Flatten_Before_News && NewsFilterEnabled && TryGetUpcomingNews(now, out var nextNews))
             {
                 var minutes = (nextNews - now).TotalMinutes;
-                if (minutes >= 0 && minutes <= FlattenMinutesBeforeNews)
+                if (minutes >= 0 && minutes <= EffectiveFlattenMinutesBeforeNews())
                 {
                     CloseBotPositions($"pre-news flatten for {nextNews:o}");
                     return;
@@ -730,7 +730,6 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                var parsed = new List<DateTime>();
                 var old = _newsTimesUtc.ToList();
                 _newsTimesUtc.Clear();
                 ParseNewsText(response.Body, false);
@@ -838,6 +837,21 @@ namespace cAlgo.Robots
                     return Math.Max(30, NewsBeforeMinutes);
                 default:
                     return Math.Max(15, NewsBeforeMinutes);
+            }
+        }
+
+        private int EffectiveFlattenMinutesBeforeNews()
+        {
+            if (!UseProfileNewsPreset)
+                return FlattenMinutesBeforeNews;
+
+            switch (Profile)
+            {
+                case FundedProfile.FTMO_Standard_Funded:
+                case FundedProfile.FundedNext_Funded:
+                    return Math.Max(15, FlattenMinutesBeforeNews);
+                default:
+                    return FlattenMinutesBeforeNews;
             }
         }
 
