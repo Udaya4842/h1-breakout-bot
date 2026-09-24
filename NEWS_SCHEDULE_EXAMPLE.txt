@@ -1,0 +1,3 @@
+# UTC timestamps separated by semicolons.
+# Replace these examples with actual current high-impact events before running.
+2026-10-02 12:30;2026-10-13 12:30;2026-10-28 18:00
