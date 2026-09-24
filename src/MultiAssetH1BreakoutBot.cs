@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using cAlgo.API;
 using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
@@ -46,6 +47,14 @@ namespace cAlgo.Robots
         private const string DefaultLabel = "H1-55-MULTI-V1";
         private const LocalStorageScope RiskStorageScope = LocalStorageScope.Type;
 
+        private sealed class EconomicEvent
+        {
+            public string Title;
+            public string Currency;
+            public string Impact;
+            public DateTime TimeUtc;
+        }
+
         private sealed class InstrumentContext
         {
             public string SymbolName;
@@ -64,6 +73,7 @@ namespace cAlgo.Robots
         private readonly Dictionary<string, InstrumentContext> _contexts =
             new Dictionary<string, InstrumentContext>(StringComparer.OrdinalIgnoreCase);
         private readonly List<DateTime> _newsTimesUtc = new List<DateTime>();
+        private readonly List<EconomicEvent> _economicEvents = new List<EconomicEvent>();
         private DateTime _lastNewsRefreshUtc = DateTime.MinValue;
         private bool _newsFeedHealthy = true;
 
@@ -160,7 +170,7 @@ namespace cAlgo.Robots
         [Parameter("Friday Force Close UTC Minute", Group = "Strategy", DefaultValue = 55, MinValue = 0, MaxValue = 59)]
         public int FridayForceCloseMinuteUtc { get; set; }
 
-        [Parameter("News Source", Group = "News", DefaultValue = NewsSourceMode.Manual_UTC)]
+        [Parameter("News Source", Group = "News", DefaultValue = NewsSourceMode.HTTP_Auto_Feed)]
         public NewsSourceMode NewsSource { get; set; }
 
         [Parameter("News Filter Enabled", Group = "News", DefaultValue = true)]
@@ -184,17 +194,20 @@ namespace cAlgo.Robots
         [Parameter("Manual News Times UTC", Group = "News", DefaultValue = "")]
         public string NewsTimesUtc { get; set; }
 
-        [Parameter("Auto News Feed URL", Group = "News", DefaultValue = "")]
+        [Parameter("Auto News Feed URL", Group = "News", DefaultValue = "https://nfs.faireconomy.media/ff_calendar_thisweek.json")]
         public string NewsFeedUrl { get; set; }
 
-        [Parameter("Auto Refresh Minutes", Group = "News", DefaultValue = 30, MinValue = 5, MaxValue = 360)]
+        [Parameter("Auto Refresh Minutes", Group = "News", DefaultValue = 60, MinValue = 15, MaxValue = 360)]
         public int NewsRefreshMinutes { get; set; }
 
         [Parameter("Fail-Lock on Feed Error", Group = "News", DefaultValue = true)]
         public bool FailLockOnNewsFeedError { get; set; }
 
-        [Parameter("Max Feed Age Minutes", Group = "News", DefaultValue = 120, MinValue = 15, MaxValue = 1440)]
+        [Parameter("Max Feed Age Minutes", Group = "News", DefaultValue = 180, MinValue = 15, MaxValue = 1440)]
         public int MaxNewsFeedAgeMinutes { get; set; }
+
+        [Parameter("Auto Feed High Impact Only", Group = "News", DefaultValue = true)]
+        public bool AutoFeedHighImpactOnly { get; set; }
 
         [Parameter("Verbose Logging", Group = "Diagnostics", DefaultValue = true)]
         public bool VerboseLogging { get; set; }
@@ -239,9 +252,11 @@ namespace cAlgo.Robots
 
             Print("START {0} | profile={1} | mode={2} | symbols={3} | startBalance={4:F2} | risk/trade={5:F2}% | maxAggRisk={6:F2}% | daily={7:F2}% | overall={8:F2}% | newsSource={9} | newsEvents={10}",
                 BotLabel, Profile, Mode, string.Join(",", _contexts.Keys), _initialReferenceEquity, RiskPerTradePercent,
-                MaxAggregatePlannedRiskPercent, DailyLossLimitPercent, OverallLossLimitPercent, NewsSource, _newsTimesUtc.Count);
+                MaxAggregatePlannedRiskPercent, DailyLossLimitPercent, OverallLossLimitPercent, NewsSource,
+                _economicEvents.Count > 0 ? _economicEvents.Count : _newsTimesUtc.Count);
 
-            if (NewsFilterEnabled && NewsSource != NewsSourceMode.Disabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
+            if (NewsFilterEnabled && NewsSource != NewsSourceMode.Disabled && RequireNewsSchedule &&
+                _newsTimesUtc.Count == 0 && _economicEvents.Count == 0)
                 Print("SAFE LOCK: News filter requires a valid schedule, but none is available. New entries are blocked.");
         }
 
@@ -418,9 +433,9 @@ namespace cAlgo.Robots
                 return;
             }
 
-            if (IsNewsBlackout(now, out var newsTime))
+            if (IsNewsBlackout(context, now, out var newsTime, out var newsLabel))
             {
-                Log($"{context.SymbolName} SIGNAL REJECTED: news blackout around {newsTime:o}");
+                Log($"{context.SymbolName} SIGNAL REJECTED: news blackout around {newsTime:o} ({newsLabel})");
                 return;
             }
 
@@ -522,7 +537,8 @@ namespace cAlgo.Robots
                 }
             }
 
-            if (NewsFilterEnabled && NewsSource != NewsSourceMode.Disabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
+            if (NewsFilterEnabled && NewsSource != NewsSourceMode.Disabled && RequireNewsSchedule &&
+                _newsTimesUtc.Count == 0 && _economicEvents.Count == 0)
             {
                 reason = "news schedule required but missing";
                 return false;
@@ -538,9 +554,9 @@ namespace cAlgo.Robots
                 }
             }
 
-            if (IsNewsBlackout(Server.TimeInUtc, out var newsTime))
+            if (IsNewsBlackout(context, Server.TimeInUtc, out var newsTime, out var newsLabel))
             {
-                reason = $"news blackout around {newsTime:o}";
+                reason = $"news blackout around {newsTime:o} ({newsLabel})";
                 return false;
             }
 
@@ -555,18 +571,22 @@ namespace cAlgo.Robots
             if (botPositions.Length == 0)
                 return;
 
-            if (EffectiveNewsPolicy() == NewsPositionPolicy.Flatten_Before_News && NewsFilterEnabled && TryGetUpcomingNews(now, out var nextNews))
-            {
-                var minutes = (nextNews - now).TotalMinutes;
-                if (minutes >= 0 && minutes <= EffectiveFlattenMinutesBeforeNews())
-                {
-                    CloseBotPositions($"pre-news flatten for {nextNews:o}");
-                    return;
-                }
-            }
-
             foreach (var position in botPositions)
             {
+                if (EffectiveNewsPolicy() == NewsPositionPolicy.Flatten_Before_News && NewsFilterEnabled &&
+                    _contexts.TryGetValue(position.SymbolName, out var positionContext) &&
+                    TryGetUpcomingRelevantNews(positionContext, now, out var nextNews, out var nextNewsLabel))
+                {
+                    var minutes = (nextNews - now).TotalMinutes;
+                    if (minutes >= 0 && minutes <= EffectiveFlattenMinutesBeforeNews())
+                    {
+                        Print("PRE-NEWS EXIT: closing {0} position {1} before {2:o} ({3}).",
+                            position.SymbolName, position.Id, nextNews, nextNewsLabel);
+                        ClosePosition(position);
+                        continue;
+                    }
+                }
+
                 if ((now - position.EntryTime).TotalHours >= MaxHoldHours)
                 {
                     Print("TIME EXIT: {0} position {1} exceeded {2} hours.", position.SymbolName, position.Id, MaxHoldHours);
@@ -681,6 +701,7 @@ namespace cAlgo.Robots
             if (!NewsFilterEnabled || NewsSource == NewsSourceMode.Disabled)
             {
                 _newsTimesUtc.Clear();
+                _economicEvents.Clear();
                 _newsFeedHealthy = true;
                 return;
             }
@@ -688,6 +709,7 @@ namespace cAlgo.Robots
             if (NewsSource == NewsSourceMode.Manual_UTC)
             {
                 _newsTimesUtc.Clear();
+                _economicEvents.Clear();
                 ParseNewsText(NewsTimesUtc, true);
                 _newsFeedHealthy = _newsTimesUtc.Count > 0 || !RequireNewsSchedule;
                 _lastNewsRefreshUtc = Server.TimeInUtc;
@@ -730,25 +752,93 @@ namespace cAlgo.Robots
                     return;
                 }
 
-                var old = _newsTimesUtc.ToList();
+                var oldTimes = _newsTimesUtc.ToList();
+                var oldEvents = _economicEvents.ToList();
                 _newsTimesUtc.Clear();
-                ParseNewsText(response.Body, false);
-                if (_newsTimesUtc.Count == 0)
+                _economicEvents.Clear();
+
+                var parsedJson = TryParseFairEconomyJson(response.Body);
+                if (!parsedJson)
+                    ParseNewsText(response.Body, false);
+
+                if (_economicEvents.Count == 0 && _newsTimesUtc.Count == 0)
                 {
-                    _newsTimesUtc.AddRange(old);
+                    _newsTimesUtc.AddRange(oldTimes);
+                    _economicEvents.AddRange(oldEvents);
                     _newsFeedHealthy = false;
-                    Print("NEWS FEED ERROR: response contained no parseable UTC timestamps; previous schedule retained.");
+                    Print("NEWS FEED ERROR: response contained no usable events; previous schedule retained.");
                     return;
                 }
 
                 _newsFeedHealthy = true;
-                Print("NEWS FEED OK: {0} events loaded at {1:o}", _newsTimesUtc.Count, _lastNewsRefreshUtc);
+                Print("NEWS FEED OK: {0} relevant events loaded at {1:o}",
+                    _economicEvents.Count > 0 ? _economicEvents.Count : _newsTimesUtc.Count, _lastNewsRefreshUtc);
             }
             catch (Exception ex)
             {
                 _lastNewsRefreshUtc = Server.TimeInUtc;
                 _newsFeedHealthy = false;
                 Print("NEWS FEED ERROR: {0}", ex.Message);
+            }
+        }
+
+        private bool TryParseFairEconomyJson(string rawText)
+        {
+            if (string.IsNullOrWhiteSpace(rawText))
+                return false;
+
+            try
+            {
+                using (var document = JsonDocument.Parse(rawText))
+                {
+                    if (document.RootElement.ValueKind != JsonValueKind.Array)
+                        return false;
+
+                    foreach (var item in document.RootElement.EnumerateArray())
+                    {
+                        if (!item.TryGetProperty("date", out var dateProperty))
+                            continue;
+
+                        var dateText = dateProperty.GetString();
+                        if (string.IsNullOrWhiteSpace(dateText) ||
+                            !DateTimeOffset.TryParse(dateText, CultureInfo.InvariantCulture,
+                                DateTimeStyles.AllowWhiteSpaces, out var dto))
+                            continue;
+
+                        var currency = item.TryGetProperty("country", out var countryProperty)
+                            ? (countryProperty.GetString() ?? string.Empty).Trim().ToUpperInvariant()
+                            : string.Empty;
+                        var impact = item.TryGetProperty("impact", out var impactProperty)
+                            ? (impactProperty.GetString() ?? string.Empty).Trim()
+                            : string.Empty;
+                        var title = item.TryGetProperty("title", out var titleProperty)
+                            ? (titleProperty.GetString() ?? string.Empty).Trim()
+                            : string.Empty;
+
+                        if (AutoFeedHighImpactOnly &&
+                            !string.Equals(impact, "High", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        if (string.IsNullOrWhiteSpace(currency))
+                            continue;
+
+                        _economicEvents.Add(new EconomicEvent
+                        {
+                            Currency = currency,
+                            Impact = impact,
+                            Title = title,
+                            TimeUtc = dto.UtcDateTime
+                        });
+                    }
+                }
+
+                _economicEvents.Sort((a, b) => a.TimeUtc.CompareTo(b.TimeUtc));
+                return _economicEvents.Count > 0;
+            }
+            catch (Exception ex)
+            {
+                Print("NEWS JSON PARSE ERROR: {0}", ex.Message);
+                return false;
             }
         }
 
@@ -873,11 +963,33 @@ namespace cAlgo.Robots
             }
         }
 
-        private bool IsNewsBlackout(DateTime nowUtc, out DateTime matchedNews)
+        private bool IsNewsBlackout(InstrumentContext context, DateTime nowUtc,
+            out DateTime matchedNews, out string matchedLabel)
         {
             matchedNews = DateTime.MinValue;
-            if (!NewsFilterEnabled || _newsTimesUtc.Count == 0)
+            matchedLabel = string.Empty;
+
+            if (!NewsFilterEnabled || NewsSource == NewsSourceMode.Disabled)
                 return false;
+
+            if (_economicEvents.Count > 0)
+            {
+                foreach (var news in _economicEvents)
+                {
+                    if (!IsEventRelevantToSymbol(context.SymbolName, news.Currency))
+                        continue;
+
+                    var start = news.TimeUtc.AddMinutes(-EffectiveNewsBeforeMinutes());
+                    var end = news.TimeUtc.AddMinutes(EffectiveNewsAfterMinutes());
+                    if (nowUtc >= start && nowUtc <= end)
+                    {
+                        matchedNews = news.TimeUtc;
+                        matchedLabel = $"{news.Currency} {news.Impact} {news.Title}".Trim();
+                        return true;
+                    }
+                }
+                return false;
+            }
 
             foreach (var news in _newsTimesUtc)
             {
@@ -886,6 +998,7 @@ namespace cAlgo.Robots
                 if (nowUtc >= start && nowUtc <= end)
                 {
                     matchedNews = news;
+                    matchedLabel = "manual/global event";
                     return true;
                 }
             }
@@ -893,10 +1006,49 @@ namespace cAlgo.Robots
             return false;
         }
 
-        private bool TryGetUpcomingNews(DateTime nowUtc, out DateTime nextNews)
+        private bool TryGetUpcomingRelevantNews(InstrumentContext context, DateTime nowUtc,
+            out DateTime nextNews, out string nextLabel)
         {
-            nextNews = _newsTimesUtc.FirstOrDefault(x => x >= nowUtc);
-            return nextNews != default(DateTime);
+            nextNews = DateTime.MinValue;
+            nextLabel = string.Empty;
+
+            if (_economicEvents.Count > 0)
+            {
+                var match = _economicEvents.FirstOrDefault(x =>
+                    x.TimeUtc >= nowUtc && IsEventRelevantToSymbol(context.SymbolName, x.Currency));
+
+                if (match == null)
+                    return false;
+
+                nextNews = match.TimeUtc;
+                nextLabel = $"{match.Currency} {match.Impact} {match.Title}".Trim();
+                return true;
+            }
+
+            var manual = _newsTimesUtc.FirstOrDefault(x => x >= nowUtc);
+            if (manual == default(DateTime))
+                return false;
+
+            nextNews = manual;
+            nextLabel = "manual/global event";
+            return true;
+        }
+
+        private static bool IsEventRelevantToSymbol(string symbolName, string eventCurrency)
+        {
+            var symbol = (symbolName ?? string.Empty).ToUpperInvariant();
+            var currency = (eventCurrency ?? string.Empty).ToUpperInvariant();
+
+            if (string.IsNullOrWhiteSpace(currency))
+                return false;
+
+            // Gold and major crypto are treated as USD-sensitive by default.
+            if (symbol.Contains("XAU") || symbol.Contains("GOLD") || symbol.Contains("BTC") ||
+                symbol.Contains("ETH") || symbol.Contains("SOL") || symbol.Contains("XRP"))
+                return currency == "USD";
+
+            // Forex symbols: relevant when the event currency is either leg.
+            return symbol.Contains(currency);
         }
 
         private bool IsAtOrAfterFridayForceClose(DateTime nowUtc)
