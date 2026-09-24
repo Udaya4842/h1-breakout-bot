@@ -25,10 +25,10 @@ No code change is needed when moving from `XAUUSD` to `GOLD`, `BTCUSDT` to `BTCU
 
 ### 3. News source and policy
 
-`News Source`:
+`News Source` default is **`HTTP_Auto_Feed`**. The bot ships with the FairEconomy/Forex Factory weekly calendar endpoint already configured, so no URL entry is required for normal use.
 
-- `Manual_UTC` — paste event timestamps into `Manual News Times UTC`.
-- `HTTP_Auto_Feed` — set `Auto News Feed URL`; the bot refreshes it automatically.
+- `HTTP_Auto_Feed` — default. Fetches the weekly calendar automatically every 60 minutes.
+- `Manual_UTC` — optional fallback; paste event timestamps into `Manual News Times UTC`.
 - `Disabled` — no news filtering.
 
 Other News parameters:
@@ -42,7 +42,7 @@ Other News parameters:
 - `Fail-Lock on Feed Error`
 - `Max Feed Age Minutes`
 
-The HTTP endpoint may return plain text, CSV-like text or JSON containing UTC timestamps in formats such as `2026-10-02 12:30` or `2026-10-02T12:30:00Z`. The bot extracts those timestamps. If a required auto feed is missing, stale or invalid and fail-lock is enabled, new entries are blocked.
+Default automatic feed: `https://nfs.faireconomy.media/ff_calendar_thisweek.json`. The bot parses the feed timezone offset into UTC, keeps **High-impact events only** by default, and applies them only to relevant instruments: USD news to XAU/Gold/BTC/crypto; either currency leg to Forex pairs. Default protection is 30 minutes before + 30 minutes after; funded profiles that require flattening use a 15-minute pre-news safety exit. If the feed is missing, stale or invalid and fail-lock is enabled, new entries are blocked.
 
 ### 4. Execution safety
 
