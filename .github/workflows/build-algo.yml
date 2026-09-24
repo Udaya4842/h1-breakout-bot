@@ -1,0 +1,40 @@
+name: Build cTrader Algo
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Restore
+        run: dotnet restore src/MultiAssetH1BreakoutBot.csproj
+
+      - name: Build cBot
+        run: dotnet build src/MultiAssetH1BreakoutBot.csproj -c Release -p:IncludeSource=True
+
+      - name: Find .algo
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Filter *.algo -Recurse | Format-Table FullName,Length
+          $files = Get-ChildItem -Path . -Filter *.algo -Recurse
+          if ($files.Count -eq 0) { throw "No .algo file generated" }
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item $files[0].FullName artifact/H1BreakoutBot.algo
+
+      - name: Upload .algo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: H1BreakoutBot-algo
+          path: artifact/H1BreakoutBot.algo
+          if-no-files-found: error
