@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.RegularExpressions;
 using cAlgo.API;
 using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
@@ -12,6 +13,31 @@ namespace cAlgo.Robots
     {
         SignalOnly,
         Trade
+    }
+
+    public enum FundedProfile
+    {
+        Custom,
+        FTMO_Evaluation,
+        FTMO_Standard_Funded,
+        FTMO_Swing,
+        FundedNext_Challenge,
+        FundedNext_Funded,
+        Live_Broker,
+        Other_Firm
+    }
+
+    public enum NewsSourceMode
+    {
+        Manual_UTC,
+        HTTP_Auto_Feed,
+        Disabled
+    }
+
+    public enum NewsPositionPolicy
+    {
+        Block_New_Entries_Only,
+        Flatten_Before_News
     }
 
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
@@ -38,6 +64,8 @@ namespace cAlgo.Robots
         private readonly Dictionary<string, InstrumentContext> _contexts =
             new Dictionary<string, InstrumentContext>(StringComparer.OrdinalIgnoreCase);
         private readonly List<DateTime> _newsTimesUtc = new List<DateTime>();
+        private DateTime _lastNewsRefreshUtc = DateTime.MinValue;
+        private bool _newsFeedHealthy = true;
 
         private double _initialReferenceEquity;
         private double _dayStartEquity;
@@ -51,14 +79,26 @@ namespace cAlgo.Robots
         private string DailyLockKey => $"{StoragePrefix} Daily Lock";
         private string OverallLockKey => $"{StoragePrefix} Overall Lock";
 
+        [Parameter("Funded / Live Profile", Group = "Account Profile", DefaultValue = FundedProfile.Custom)]
+        public FundedProfile Profile { get; set; }
+
+        [Parameter("Use Profile News Preset", Group = "Account Profile", DefaultValue = false)]
+        public bool UseProfileNewsPreset { get; set; }
+
+        [Parameter("Account Start Balance", Group = "Account Profile", DefaultValue = 0.0, MinValue = 0.0)]
+        public double ReferenceInitialBalance { get; set; }
+
         [Parameter("Execution Mode", Group = "Safety", DefaultValue = ExecutionMode.SignalOnly)]
         public ExecutionMode Mode { get; set; }
 
         [Parameter("Bot Label", Group = "Safety", DefaultValue = DefaultLabel)]
         public string BotLabel { get; set; }
 
-        [Parameter("Symbol Groups", Group = "Markets", DefaultValue = "XAUUSD|GOLD;BTCUSDT|BTCUSD;EURUSD;GBPUSD;USDJPY")]
-        public string SymbolGroups { get; set; }
+        [Parameter("Trade Symbols", Group = "Markets", DefaultValue = "XAUUSD,EURUSD,GBPUSD,USDJPY")]
+        public Symbol[] TradeSymbols { get; set; }
+
+        [Parameter("Extra Symbol Aliases", Group = "Markets", DefaultValue = "BTCUSDT|BTCUSD;XAUUSD|GOLD")]
+        public string ExtraSymbolAliases { get; set; }
 
         [Parameter("Allow Crypto Weekend", Group = "Markets", DefaultValue = true)]
         public bool AllowCryptoWeekend { get; set; }
@@ -74,9 +114,6 @@ namespace cAlgo.Robots
 
         [Parameter("Max USD-Sensitive Positions", Group = "Risk", DefaultValue = 2, MinValue = 1, MaxValue = 10)]
         public int MaxUsdSensitivePositions { get; set; }
-
-        [Parameter("Reference Initial Balance", Group = "Risk", DefaultValue = 0.0, MinValue = 0.0)]
-        public double ReferenceInitialBalance { get; set; }
 
         [Parameter("Daily Loss Limit %", Group = "Risk", DefaultValue = 2.0, MinValue = 0.25, MaxValue = 10.0, Step = 0.25)]
         public double DailyLossLimitPercent { get; set; }
@@ -123,26 +160,41 @@ namespace cAlgo.Robots
         [Parameter("Friday Force Close UTC Minute", Group = "Strategy", DefaultValue = 55, MinValue = 0, MaxValue = 59)]
         public int FridayForceCloseMinuteUtc { get; set; }
 
+        [Parameter("News Source", Group = "News", DefaultValue = NewsSourceMode.Manual_UTC)]
+        public NewsSourceMode NewsSource { get; set; }
+
         [Parameter("News Filter Enabled", Group = "News", DefaultValue = true)]
         public bool NewsFilterEnabled { get; set; }
 
-        [Parameter("Require News Schedule", Group = "News", DefaultValue = true)]
+        [Parameter("Require Valid News Schedule", Group = "News", DefaultValue = true)]
         public bool RequireNewsSchedule { get; set; }
 
-        [Parameter("News Before Minutes", Group = "News", DefaultValue = 30, MinValue = 0, MaxValue = 180)]
+        [Parameter("Position Policy", Group = "News", DefaultValue = NewsPositionPolicy.Flatten_Before_News)]
+        public NewsPositionPolicy NewsPolicy { get; set; }
+
+        [Parameter("No Entry Before (min)", Group = "News", DefaultValue = 30, MinValue = 0, MaxValue = 180)]
         public int NewsBeforeMinutes { get; set; }
 
-        [Parameter("News After Minutes", Group = "News", DefaultValue = 30, MinValue = 0, MaxValue = 180)]
+        [Parameter("No Entry After (min)", Group = "News", DefaultValue = 30, MinValue = 0, MaxValue = 180)]
         public int NewsAfterMinutes { get; set; }
 
-        [Parameter("Flatten Before News", Group = "News", DefaultValue = true)]
-        public bool FlattenBeforeNews { get; set; }
-
-        [Parameter("Flatten Minutes Before", Group = "News", DefaultValue = 15, MinValue = 0, MaxValue = 120)]
+        [Parameter("Flatten Before (min)", Group = "News", DefaultValue = 15, MinValue = 0, MaxValue = 120)]
         public int FlattenMinutesBeforeNews { get; set; }
 
-        [Parameter("News Times UTC", Group = "News", DefaultValue = "")]
+        [Parameter("Manual News Times UTC", Group = "News", DefaultValue = "")]
         public string NewsTimesUtc { get; set; }
+
+        [Parameter("Auto News Feed URL", Group = "News", DefaultValue = "")]
+        public string NewsFeedUrl { get; set; }
+
+        [Parameter("Auto Refresh Minutes", Group = "News", DefaultValue = 30, MinValue = 5, MaxValue = 360)]
+        public int NewsRefreshMinutes { get; set; }
+
+        [Parameter("Fail-Lock on Feed Error", Group = "News", DefaultValue = true)]
+        public bool FailLockOnNewsFeedError { get; set; }
+
+        [Parameter("Max Feed Age Minutes", Group = "News", DefaultValue = 120, MinValue = 15, MaxValue = 1440)]
+        public int MaxNewsFeedAgeMinutes { get; set; }
 
         [Parameter("Verbose Logging", Group = "Diagnostics", DefaultValue = true)]
         public bool VerboseLogging { get; set; }
@@ -168,7 +220,7 @@ namespace cAlgo.Robots
             if (ResetStoredRiskState)
                 ResetRiskState();
 
-            ParseNewsSchedule();
+            LoadNewsSchedule(true);
             RestoreRiskState();
             BuildInstrumentContexts();
 
@@ -185,9 +237,9 @@ namespace cAlgo.Robots
             Positions.Closed += OnPositionClosed;
             Timer.Start(TimeSpan.FromSeconds(10));
 
-            Print("START {0} | mode={1} | symbols={2} | risk/trade={3:F2}% | maxAggRisk={4:F2}% | daily={5:F2}% | overall={6:F2}% | newsEvents={7}",
-                BotLabel, Mode, string.Join(",", _contexts.Keys), RiskPerTradePercent,
-                MaxAggregatePlannedRiskPercent, DailyLossLimitPercent, OverallLossLimitPercent, _newsTimesUtc.Count);
+            Print("START {0} | profile={1} | mode={2} | symbols={3} | startBalance={4:F2} | risk/trade={5:F2}% | maxAggRisk={6:F2}% | daily={7:F2}% | overall={8:F2}% | newsSource={9} | newsEvents={10}",
+                BotLabel, Profile, Mode, string.Join(",", _contexts.Keys), _initialReferenceEquity, RiskPerTradePercent,
+                MaxAggregatePlannedRiskPercent, DailyLossLimitPercent, OverallLossLimitPercent, NewsSource, _newsTimesUtc.Count);
 
             if (NewsFilterEnabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
                 Print("SAFE LOCK: News filter requires a schedule, but News Times UTC is empty/invalid. New entries are blocked.");
@@ -196,6 +248,7 @@ namespace cAlgo.Robots
         protected override void OnTimer()
         {
             RefreshDailyStateIfNeeded();
+            RefreshNewsScheduleIfDue();
             EnforceRiskGuards();
             ManageOpenPositions();
         }
@@ -211,7 +264,18 @@ namespace cAlgo.Robots
         private void BuildInstrumentContexts()
         {
             _contexts.Clear();
-            var groups = (SymbolGroups ?? string.Empty)
+            var resolvedSymbols = new List<Symbol>();
+
+            if (TradeSymbols != null)
+            {
+                foreach (var selected in TradeSymbols)
+                {
+                    if (selected != null && resolvedSymbols.All(x => !string.Equals(x.Name, selected.Name, StringComparison.OrdinalIgnoreCase)))
+                        resolvedSymbols.Add(selected);
+                }
+            }
+
+            var groups = (ExtraSymbolAliases ?? string.Empty)
                 .Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 
             foreach (var rawGroup in groups)
@@ -220,9 +284,6 @@ namespace cAlgo.Robots
                     .Select(x => x.Trim())
                     .Where(x => !string.IsNullOrWhiteSpace(x))
                     .ToArray();
-
-                if (aliases.Length == 0)
-                    continue;
 
                 Symbol resolved = null;
                 foreach (var alias in aliases)
@@ -240,6 +301,12 @@ namespace cAlgo.Robots
                     continue;
                 }
 
+                if (resolvedSymbols.All(x => !string.Equals(x.Name, resolved.Name, StringComparison.OrdinalIgnoreCase)))
+                    resolvedSymbols.Add(resolved);
+            }
+
+            foreach (var resolved in resolvedSymbols)
+            {
                 if (_contexts.ContainsKey(resolved.Name))
                     continue;
 
@@ -260,8 +327,8 @@ namespace cAlgo.Robots
                 };
 
                 _contexts.Add(resolved.Name, context);
-                Print("SYMBOL READY: group={0} -> {1} | crypto={2} | USD-sensitive={3}",
-                    rawGroup.Trim(), resolved.Name, context.IsCrypto, context.IsUsdSensitive);
+                Print("SYMBOL READY: {0} | crypto={1} | USD-sensitive={2}",
+                    resolved.Name, context.IsCrypto, context.IsUsdSensitive);
             }
         }
 
@@ -455,10 +522,20 @@ namespace cAlgo.Robots
                 }
             }
 
-            if (NewsFilterEnabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
+            if (NewsFilterEnabled && NewsSource != NewsSourceMode.Disabled && RequireNewsSchedule && _newsTimesUtc.Count == 0)
             {
                 reason = "news schedule required but missing";
                 return false;
+            }
+
+            if (NewsFilterEnabled && NewsSource == NewsSourceMode.HTTP_Auto_Feed && FailLockOnNewsFeedError)
+            {
+                var feedAge = Server.TimeInUtc - _lastNewsRefreshUtc;
+                if (!_newsFeedHealthy || _lastNewsRefreshUtc == DateTime.MinValue || feedAge.TotalMinutes > MaxNewsFeedAgeMinutes)
+                {
+                    reason = "automatic news feed unhealthy/stale";
+                    return false;
+                }
             }
 
             if (IsNewsBlackout(Server.TimeInUtc, out var newsTime))
@@ -478,7 +555,7 @@ namespace cAlgo.Robots
             if (botPositions.Length == 0)
                 return;
 
-            if (FlattenBeforeNews && NewsFilterEnabled && TryGetUpcomingNews(now, out var nextNews))
+            if (EffectiveNewsPolicy() == NewsPositionPolicy.Flatten_Before_News && NewsFilterEnabled && TryGetUpcomingNews(now, out var nextNews))
             {
                 var minutes = (nextNews - now).TotalMinutes;
                 if (minutes >= 0 && minutes <= FlattenMinutesBeforeNews)
@@ -599,37 +676,187 @@ namespace cAlgo.Robots
             Print("Stored risk state reset requested. Set the parameter back to false after this start.");
         }
 
-        private void ParseNewsSchedule()
+        private void LoadNewsSchedule(bool force)
         {
-            _newsTimesUtc.Clear();
-            if (string.IsNullOrWhiteSpace(NewsTimesUtc))
+            if (!NewsFilterEnabled || NewsSource == NewsSourceMode.Disabled)
+            {
+                _newsTimesUtc.Clear();
+                _newsFeedHealthy = true;
+                return;
+            }
+
+            if (NewsSource == NewsSourceMode.Manual_UTC)
+            {
+                _newsTimesUtc.Clear();
+                ParseNewsText(NewsTimesUtc, true);
+                _newsFeedHealthy = _newsTimesUtc.Count > 0 || !RequireNewsSchedule;
+                _lastNewsRefreshUtc = Server.TimeInUtc;
+                return;
+            }
+
+            if (NewsSource == NewsSourceMode.HTTP_Auto_Feed)
+            {
+                if (!force && _lastNewsRefreshUtc != DateTime.MinValue &&
+                    (Server.TimeInUtc - _lastNewsRefreshUtc).TotalMinutes < NewsRefreshMinutes)
+                    return;
+
+                RefreshNewsFromHttp();
+            }
+        }
+
+        private void RefreshNewsScheduleIfDue()
+        {
+            LoadNewsSchedule(false);
+        }
+
+        private void RefreshNewsFromHttp()
+        {
+            if (string.IsNullOrWhiteSpace(NewsFeedUrl))
+            {
+                _newsFeedHealthy = false;
+                Print("NEWS FEED ERROR: HTTP_Auto_Feed selected but Auto News Feed URL is empty.");
+                return;
+            }
+
+            try
+            {
+                var response = Http.Get(NewsFeedUrl.Trim());
+                _lastNewsRefreshUtc = Server.TimeInUtc;
+
+                if (!response.IsSuccessful)
+                {
+                    _newsFeedHealthy = false;
+                    Print("NEWS FEED ERROR: HTTP GET failed for {0}", NewsFeedUrl);
+                    return;
+                }
+
+                var parsed = new List<DateTime>();
+                var old = _newsTimesUtc.ToList();
+                _newsTimesUtc.Clear();
+                ParseNewsText(response.Body, false);
+                if (_newsTimesUtc.Count == 0)
+                {
+                    _newsTimesUtc.AddRange(old);
+                    _newsFeedHealthy = false;
+                    Print("NEWS FEED ERROR: response contained no parseable UTC timestamps; previous schedule retained.");
+                    return;
+                }
+
+                _newsFeedHealthy = true;
+                Print("NEWS FEED OK: {0} events loaded at {1:o}", _newsTimesUtc.Count, _lastNewsRefreshUtc);
+            }
+            catch (Exception ex)
+            {
+                _lastNewsRefreshUtc = Server.TimeInUtc;
+                _newsFeedHealthy = false;
+                Print("NEWS FEED ERROR: {0}", ex.Message);
+            }
+        }
+
+        private void ParseNewsText(string rawText, bool printWarnings)
+        {
+            if (string.IsNullOrWhiteSpace(rawText))
                 return;
 
-            var parts = NewsTimesUtc.Split(new[] { ';', ',', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
             var formats = new[]
             {
                 "yyyy-MM-dd HH:mm",
                 "yyyy-MM-dd HH:mm:ss",
                 "yyyy-MM-ddTHH:mm",
                 "yyyy-MM-ddTHH:mm:ss",
-                "yyyy-MM-ddTHH:mm:ssZ"
+                "yyyy-MM-ddTHH:mm:ssZ",
+                "yyyy-MM-ddTHH:mm:ss+00:00"
             };
 
-            foreach (var raw in parts)
+            var candidates = new List<string>();
+            candidates.AddRange(rawText.Split(new[] { ';', ',', '\n', '\r', '\t', '"', '[', ']', '{', '}' },
+                StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()));
+
+            foreach (Match match in Regex.Matches(rawText,
+                @"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|\+00:00)?"))
             {
-                var text = raw.Trim();
+                candidates.Add(match.Value);
+            }
+
+            foreach (var text in candidates.Distinct())
+            {
                 if (DateTime.TryParseExact(text, formats, CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dt))
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var exact))
                 {
-                    _newsTimesUtc.Add(DateTime.SpecifyKind(dt, DateTimeKind.Utc));
+                    AddNewsTime(exact);
+                    continue;
                 }
-                else
+
+                if (DateTime.TryParse(text, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var flexible))
                 {
-                    Print("NEWS PARSE WARNING: could not parse '{0}' as UTC.", text);
+                    AddNewsTime(flexible);
+                }
+                else if (printWarnings && text.Length >= 10)
+                {
+                    Log($"NEWS PARSE WARNING: ignored '{text}'.");
                 }
             }
 
             _newsTimesUtc.Sort();
+        }
+
+        private void AddNewsTime(DateTime dt)
+        {
+            var utc = DateTime.SpecifyKind(dt.ToUniversalTime(), DateTimeKind.Utc);
+            if (!_newsTimesUtc.Contains(utc))
+                _newsTimesUtc.Add(utc);
+        }
+
+        private NewsPositionPolicy EffectiveNewsPolicy()
+        {
+            if (!UseProfileNewsPreset)
+                return NewsPolicy;
+
+            switch (Profile)
+            {
+                case FundedProfile.FTMO_Standard_Funded:
+                case FundedProfile.FundedNext_Funded:
+                    return NewsPositionPolicy.Flatten_Before_News;
+                default:
+                    return NewsPositionPolicy.Block_New_Entries_Only;
+            }
+        }
+
+        private int EffectiveNewsBeforeMinutes()
+        {
+            if (!UseProfileNewsPreset)
+                return NewsBeforeMinutes;
+
+            switch (Profile)
+            {
+                case FundedProfile.FTMO_Standard_Funded:
+                    return Math.Max(15, NewsBeforeMinutes);
+                case FundedProfile.FundedNext_Funded:
+                    return Math.Max(15, NewsBeforeMinutes);
+                case FundedProfile.Live_Broker:
+                    return Math.Max(30, NewsBeforeMinutes);
+                default:
+                    return Math.Max(15, NewsBeforeMinutes);
+            }
+        }
+
+        private int EffectiveNewsAfterMinutes()
+        {
+            if (!UseProfileNewsPreset)
+                return NewsAfterMinutes;
+
+            switch (Profile)
+            {
+                case FundedProfile.FTMO_Standard_Funded:
+                    return Math.Max(15, NewsAfterMinutes);
+                case FundedProfile.FundedNext_Funded:
+                    return Math.Max(15, NewsAfterMinutes);
+                case FundedProfile.Live_Broker:
+                    return Math.Max(30, NewsAfterMinutes);
+                default:
+                    return Math.Max(15, NewsAfterMinutes);
+            }
         }
 
         private bool IsNewsBlackout(DateTime nowUtc, out DateTime matchedNews)
@@ -640,8 +867,8 @@ namespace cAlgo.Robots
 
             foreach (var news in _newsTimesUtc)
             {
-                var start = news.AddMinutes(-NewsBeforeMinutes);
-                var end = news.AddMinutes(NewsAfterMinutes);
+                var start = news.AddMinutes(-EffectiveNewsBeforeMinutes());
+                var end = news.AddMinutes(EffectiveNewsAfterMinutes());
                 if (nowUtc >= start && nowUtc <= end)
                 {
                     matchedNews = news;
