@@ -566,6 +566,9 @@ namespace cAlgo.Robots
 
         private void ManageOpenPositions()
         {
+            if (Mode == ExecutionMode.SignalOnly)
+                return;
+
             var now = Server.TimeInUtc;
             var botPositions = GetBotPositions().ToArray();
             if (botPositions.Length == 0)
@@ -1064,6 +1067,9 @@ namespace cAlgo.Robots
 
         private void CloseBotPositions(string reason)
         {
+            if (Mode == ExecutionMode.SignalOnly)
+                return;
+
             foreach (var position in GetBotPositions().ToArray())
             {
                 Print("CLOSE BOT POSITION {0} {1}: {2}", position.SymbolName, position.Id, reason);
