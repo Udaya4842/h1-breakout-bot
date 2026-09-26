@@ -9,9 +9,73 @@ on:
       - '.github/workflows/backtest.yml'
 
 jobs:
-  backtest:
+  forex-data:
+    name: Download FX ${{ matrix.symbol }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        symbol: [EURUSD, GBPUSD, USDJPY]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download ${{ matrix.symbol }} from Dukascopy
+        run: |
+          git clone --depth 1 https://github.com/saleem-latif/duka-data.git /tmp/duka-data
+          pip install -r /tmp/duka-data/requirements.txt
+          cd /tmp/duka-data
+          python download.py --symbols ${{ matrix.symbol }} --start 2024-09-24 --end 2026-09-23 || true
+          python download.py --repair --symbols ${{ matrix.symbol }} --start 2024-09-24 --end 2026-09-23 || true
+          mkdir -p "$GITHUB_WORKSPACE/data/forex"
+          cp compiled/${{ matrix.symbol }}_M5.csv compiled/${{ matrix.symbol }}_H1.csv compiled/${{ matrix.symbol }}_H4.csv "$GITHUB_WORKSPACE/data/forex/"
+
+      - name: Upload ${{ matrix.symbol }} data
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-${{ matrix.symbol }}-data
+          path: data/forex/
+          if-no-files-found: error
+          retention-days: 3
+
+  btc-data:
+    name: Download BTCUSDT
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: research/requirements.txt
+
+      - run: pip install -r research/requirements.txt
+
+      - name: Download BTCUSDT from Binance public archive
+        run: python research/download_btc.py --symbol BTCUSDT --start 2024-09-24 --end 2026-09-23 --outdir data/btc
+
+      - name: Upload BTC data
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-data
+          path: data/btc/
+          if-no-files-found: error
+          retention-days: 3
+
+  backtest:
+    name: Run backtests
+    needs: [forex-data, btc-data]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,20 +87,18 @@ jobs:
 
       - run: pip install -r research/requirements.txt tabulate
 
-      - name: Download Forex from Dukascopy
-        run: |
-          git clone --depth 1 https://github.com/saleem-latif/duka-data.git /tmp/duka-data
-          pip install -r /tmp/duka-data/requirements.txt
-          cd /tmp/duka-data
-          python download.py --symbols EURUSD GBPUSD USDJPY --start 2024-09-24 --end 2026-09-23 || true
-          python download.py --repair --symbols EURUSD GBPUSD USDJPY --start 2024-09-24 --end 2026-09-23 || true
-          mkdir -p "$GITHUB_WORKSPACE/data/forex"
-          cp compiled/EURUSD_M5.csv compiled/EURUSD_H1.csv compiled/EURUSD_H4.csv "$GITHUB_WORKSPACE/data/forex/"
-          cp compiled/GBPUSD_M5.csv compiled/GBPUSD_H1.csv compiled/GBPUSD_H4.csv "$GITHUB_WORKSPACE/data/forex/"
-          cp compiled/USDJPY_M5.csv compiled/USDJPY_H1.csv compiled/USDJPY_H4.csv "$GITHUB_WORKSPACE/data/forex/"
+      - name: Download FX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fx-*-data
+          path: data/forex
+          merge-multiple: true
 
-      - name: Download BTCUSDT from Binance public archive
-        run: python research/download_btc.py --symbol BTCUSDT --start 2024-09-24 --end 2026-09-23 --outdir data/btc
+      - name: Download BTC artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: btc-data
+          path: data/btc
 
       - name: Run strategy backtests
         run: python research/run_all.py --data-root data --reports-root reports --btc-cost-bps 5
@@ -46,4 +108,5 @@ jobs:
         with:
           name: h1-breakout-2y-results
           path: reports/
+          if-no-files-found: error
           retention-days: 30
