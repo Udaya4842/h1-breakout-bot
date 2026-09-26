@@ -3,3 +3,14 @@ obj/
 *.algo
 .vs/
 .idea/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+data/*
+!data/.gitignore
+reports/*
+!reports/.gitignore
